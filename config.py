@@ -141,7 +141,7 @@ MAX_RECORDING_DURATION = int(os.environ.get("MAX_RECORDING_DURATION", 28800))  #
 RECORDINGS_RETENTION_DAYS = int(os.environ.get("RECORDINGS_RETENTION_DAYS", 7))  # Auto-cleanup after 7 days
 
 # --- Version/Mode Configuration ---
-APP_VERSION = "2.5.4"
+APP_VERSION = "2.5.5"
 
 # Detect if we are running in Full or Light mode
 _has_solvers = os.path.exists("flaresolverr") and (os.path.exists("byparr") or os.path.exists("byparr_src"))
@@ -156,27 +156,20 @@ if DVR_ENABLED and not os.path.exists(RECORDINGS_DIR):
     logging.info(f"📹 Created recordings directory: {RECORDINGS_DIR}")
 
 # MPD Processing Mode detection
-_mpd_mode_env = os.environ.get("MPD_MODE", "").lower()
+_mpd_mode_env = os.environ.get("MPD_MODE", "legacy").lower()
 
-if not _mpd_mode_env:
-    # Se la variabile non è presente, disattiva il remuxing di default
-    MPD_MODE = "none"
-    ENABLE_REMUXING = False
-    logging.info("🎬 MPD_MODE non impostata: remuxing disattivato (fMP4 diretto)")
+if _mpd_mode_env in ("ffmpeg", "legacy", "none", "disabled"):
+    MPD_MODE = _mpd_mode_env
 else:
-    # Se presente, valida il valore
-    if _mpd_mode_env in ("ffmpeg", "legacy", "none", "disabled"):
-        MPD_MODE = _mpd_mode_env
-    else:
-        logging.warning(f"⚠️ MPD_MODE '{_mpd_mode_env}' non valida. Uso 'legacy'.")
-        MPD_MODE = "legacy"
-    
-    # Abilita remuxing solo per modalità attive
-    ENABLE_REMUXING = os.environ.get("ENABLE_REMUXING", "true").lower() in ("true", "1", "yes")
-    if MPD_MODE in ("none", "disabled"):
-        ENABLE_REMUXING = False
+    logging.warning(f"⚠️ MPD_MODE '{_mpd_mode_env}' non valida. Uso 'legacy'.")
+    MPD_MODE = "legacy"
 
-    logging.info(f"🎬 MPD Mode: {MPD_MODE} (Remuxing: {'ON' if ENABLE_REMUXING else 'OFF'})")
+# Il remuxing è attivo di default per legacy/ffmpeg, ma spento per none/disabled
+ENABLE_REMUXING = os.environ.get("ENABLE_REMUXING", "true").lower() in ("true", "1", "yes")
+if MPD_MODE in ("none", "disabled"):
+    ENABLE_REMUXING = False
+
+logging.info(f"🎬 MPD Mode: {MPD_MODE} (Remuxing: {'ON' if ENABLE_REMUXING else 'OFF'})")
 
 # --- FlareSolverr / Byparr Configuration ---
 FLARESOLVERR_URL = os.environ.get("FLARESOLVERR_URL", "http://localhost:8191").rstrip("/")

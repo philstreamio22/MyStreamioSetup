@@ -49,10 +49,10 @@ from config import (
 from extractors.generic import GenericHLSExtractor, ExtractorError
 from services.manifest_rewriter import ManifestRewriter
 
-# Legacy MPD converter (used when MPD_MODE=legacy)
+# Legacy MPD converter (used when MPD_MODE is not ffmpeg)
 MPDToHLSConverter = None
 decrypt_segment = None
-if MPD_MODE == "legacy":
+if MPD_MODE in ("legacy", "none", "disabled"):
     try:
         from utils.mpd_converter import MPDToHLSConverter
         from utils.drm_decrypter import decrypt_segment
@@ -1306,10 +1306,6 @@ class HLSProxy:
             # (e.g. "dashinripe" in URL being mistaken for a DASH manifest).
             is_mpd = ".mpd" in stream_url.lower() or "/dash/" in stream_url.lower()
             if is_mpd:
-                if MPD_MODE in ("none", "disabled"):
-                    logger.info(f"⏩ [None Mode] Serving raw MPD manifest: {stream_url}")
-                    return web.HTTPFound(location=stream_url)
-
                 if MPD_MODE == "ffmpeg" and self.ffmpeg_manager:
                     # FFmpeg transcoding mode
                     logger.info(
@@ -2492,7 +2488,7 @@ class HLSProxy:
                                     clearkey_param = ",".join(clearkey_parts)
 
                     # --- LEGACY MODE: MPD -> HLS Conversion ---
-                    if MPD_MODE == "legacy" and MPDToHLSConverter:
+                    if MPD_MODE in ("legacy", "none", "disabled") and MPDToHLSConverter:
                         logger.info(
                             f"🔄 [Legacy Mode] Converting MPD to HLS for {stream_url}"
                         )
@@ -3273,7 +3269,7 @@ class HLSProxy:
 
         if decrypt_segment is None:
             return web.Response(
-                text="Decrypt not available (MPD_MODE is not legacy)", status=503
+                text="Decrypt not available (MPD_MODE is ffmpeg or disabled)", status=503
             )
 
         # Check cache first
