@@ -59,7 +59,17 @@ class VavooExtractor:
                 if any(d in domain.lower() for d in bypass_domains):
                     logger.info(f"⚡ [Vavoo Bypass] Excluding {domain} from WARP...")
                     os.system(f"warp-cli --accept-tos tunnel host add {domain} > /dev/null 2>&1")
+                    # Bypass also base domain if it's a subdomain
+                    base_domain = ".".join(domain.split(".")[-2:])
+                    if base_domain != domain:
+                        os.system(f"warp-cli --accept-tos tunnel host add {base_domain} > /dev/null 2>&1")
+                    
                     self.bypassed_domains.add(domain)
+                    self.bypassed_domains.add(base_domain)
+                    
+                    # Small sleep to let WARP stabilize routing table
+                    import time
+                    time.sleep(0.5)
         except:
             pass
 

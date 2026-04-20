@@ -57,6 +57,9 @@ if [ "$ENABLE_WARP" = "true" ]; then
         # Set mode to WARP (Full TUN/VPN mode)
         warp-cli --accept-tos mode warp
         
+        warp-cli --accept-tos tunnel host add vavoo.to
+        warp-cli --accept-tos tunnel host add www.lokke.app
+        warp-cli --accept-tos tunnel host add mediahubmx.cc
         warp-cli --accept-tos connect
         
         # Small delay for connection to stabilize
