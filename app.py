@@ -176,7 +176,6 @@ def create_app():
 
     # ✅ NUOVO: Endpoint per ottenere l'IP pubblico
     app.router.add_get('/proxy/ip', proxy.handle_proxy_ip)
-
     # Setup recording/DVR routes (only if enabled)
     if DVR_ENABLED:
         setup_recording_routes(app, recording_manager)
@@ -190,6 +189,7 @@ def create_app():
     
     async def on_startup(app):
         asyncio.create_task(ffmpeg_manager.cleanup_loop())
+        asyncio.create_task(proxy.start_tasks())
         if DVR_ENABLED:
             asyncio.create_task(recording_manager.cleanup_loop())
     app.on_startup.append(on_startup)
