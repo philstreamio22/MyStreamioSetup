@@ -113,8 +113,8 @@ class DeltabitExtractor:
         
         session_id = None
         try:
-            # Start session for better performance (persistence of cookies/browser state)
-            sess_res = await self._request_flaresolverr("sessions.create")
+            # Start session with the target URL to ensure correct proxy initialization
+            sess_res = await self._request_flaresolverr("sessions.create", url=url)
             session_id = sess_res.get("session")
 
             # GET first page
@@ -196,7 +196,7 @@ class DeltabitExtractor:
             ocr = None
 
         try:
-            sess_res = await self._request_flaresolverr("sessions.create")
+            sess_res = await self._request_flaresolverr("sessions.create", url=url)
             session_id = sess_res.get("session")
 
             current_url = url
