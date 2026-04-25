@@ -590,8 +590,7 @@ class HLSProxy:
         # Patterns for domains that usually block Cloudflare/WARP
         # Cinemacity, VixSrc, etc.
         bypass_patterns = [
-            "cccdn.net", "cinemacity.cc", "strem.fun", "torrentio.strem.fun",
-            "vavoo.to", "vavoo.tv", "lokke.app"
+            "cccdn.net", "cinemacity.cc", "strem.fun", "torrentio.strem.fun"
         ]
         
         try:
@@ -623,7 +622,7 @@ class HLSProxy:
         except Exception as e:
             logging.error(f"❌ Error in dynamic WARP bypass: {e}")
 
-    async def _get_proxy_session(self, url: str, bypass_warp: bool = False):
+    async def _get_proxy_session(self, url: str, bypass_warp: bool = False, forced_proxy: str | None = None):
         """Get a session with proxy support for the given URL.
 
         Sessions are cached and reused for the same proxy to improve performance.
@@ -635,7 +634,11 @@ class HLSProxy:
         # Trigger dynamic bypass check before getting proxy settings
         self._check_dynamic_warp_bypass(url, force=bypass_warp)
         
-        proxy = get_proxy_for_url(url, TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
+        # ✅ FIX: Decodifica il proxy se è URL-encoded
+        if forced_proxy:
+            forced_proxy = urllib.parse.unquote(forced_proxy)
+        
+        proxy = forced_proxy or get_proxy_for_url(url, TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
 
         prefer_default_family = "ai.the-sunmoon.site/key/" in url
 
@@ -756,7 +759,13 @@ class HLSProxy:
                 key = f"{host}_direct" if bypass_warp else host
                 
                 # ✅ FIX: Calcola il proxy corretto in base a bypass_warp invece di usare GLOBAL_PROXIES indiscriminatamente
-                proxy = get_proxy_for_url(host, TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
+                proxy_lookup_target = url if host in ["doodstream", "dood", "d000d"] else host
+                proxy = get_proxy_for_url(
+                    proxy_lookup_target,
+                    TRANSPORT_ROUTES,
+                    GLOBAL_PROXIES,
+                    bypass_warp=bypass_warp,
+                )
                 proxy_list = [proxy] if proxy else []
 
                 if host == "vavoo":
@@ -1104,7 +1113,7 @@ class HLSProxy:
             ):
                 key = "doodstream_direct" if bypass_warp else "doodstream"
                 proxy = get_proxy_for_url(
-                    "doodstream", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp
+                    url, TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp
                 )
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
@@ -1310,11 +1319,10 @@ class HLSProxy:
             return web.Response(status=401, text="Unauthorized: Invalid API Password")
 
         target_url = request.query.get("url") or request.query.get("d")
-        bypass_warp = (request.query.get("warp", "").lower() == "off") or (
-            target_url and ("vavoo.to" in target_url or "vavoo.tv" in target_url)
-        )
+        bypass_warp = (request.query.get("warp", "").lower() == "off")
         token = BYPASS_WARP_CONTEXT.set(bypass_warp)
         proxy_token = SELECTED_PROXY_CONTEXT.set(None)
+        selected_proxy = None
         
         try:
             extractor = None
@@ -1386,13 +1394,25 @@ class HLSProxy:
                     target_url,
                     force_refresh=force_refresh,
                     request_headers=combined_headers,
-                    bypass_warp=bypass_warp
+                    bypass_warp=bypass_warp,
+                    proxy=request.query.get("proxy")
                 )
                 bypass_warp = result.get("bypass_warp", bypass_warp)
                 stream_url = result["destination_url"]
                 stream_headers = result.get("request_headers", {})
                 captured_manifest = result.get("captured_manifest")
                 force_disable_ssl = result.get("disable_ssl", False)
+                
+                # Cattura e sanifica il proxy per evitare double-encoding (%253A -> %3A)
+                raw_proxy = request.query.get("proxy") or result.get("selected_proxy")
+                if raw_proxy:
+                    # Sanifica e assegna alla variabile che verrà usata dopo
+                    selected_proxy = urllib.parse.unquote(raw_proxy)
+                    if "://" not in selected_proxy and "%3a" in selected_proxy.lower():
+                        selected_proxy = urllib.parse.unquote(selected_proxy)
+                
+                if selected_proxy:
+                    logger.debug(f"🎯 Final selected proxy for manifest: {selected_proxy}")
 
                 if force_disable_ssl:
                     if "?" in stream_url:
@@ -1452,6 +1472,7 @@ class HLSProxy:
                     "cinemacity.cc" in (original_channel_url or "").lower()
                     or request.query.get("host", "").lower() in {"city", "cinemacity"}
                 )
+                disable_ssl = request.query.get("disable_ssl") == "1" or force_disable_ssl
                 rewritten_manifest = await ManifestRewriter.rewrite_manifest_urls(
                     manifest_content=captured_manifest,
                     base_url=stream_url,
@@ -1463,6 +1484,8 @@ class HLSProxy:
                     no_bypass=no_bypass,
                     shorten_url_func=self.shorten_hls_url if use_short_hls_urls else None,
                     bypass_warp=bypass_warp,
+                    disable_ssl=disable_ssl,
+                    selected_proxy=selected_proxy,
                 )
                 return web.Response(
                     text=rewritten_manifest,
@@ -1751,8 +1774,8 @@ class HLSProxy:
                         },
                     )
 
-            # Procedi con il proxy dello stream (passando l'eventuale bypass_warp attivato dall'estrattore)
-            return await self._proxy_stream(request, stream_url, stream_headers, bypass_warp=bypass_warp)
+            # Procedi con il proxy dello stream (passando l'eventuale bypass_warp attivato dall'estrattore e il proxy selezionato)
+            return await self._proxy_stream(request, stream_url, stream_headers, bypass_warp=bypass_warp, forced_proxy=selected_proxy)
 
         except Exception as e:
             # ✅ MIGLIORATO: Distingui tra errori temporanei (sito offline) ed errori critici
@@ -1932,7 +1955,10 @@ class HLSProxy:
             stream_headers = result.get("request_headers", {})
             mediaflow_endpoint = result.get("mediaflow_endpoint", "hls_proxy")
             force_disable_ssl = result.get("disable_ssl", False)
+            selected_proxy = result.get("selected_proxy")
             bypass_warp = result.get("bypass_warp", bypass_warp)
+            
+            logger.debug(f"Extractor Debug: Extractor result selected_proxy: {selected_proxy}")
             
             # Log dello stato dell'estrattore
             logger.debug(f"Extractor Debug: Extractor result bypass_warp: {result.get('bypass_warp')}")
@@ -1981,6 +2007,8 @@ class HLSProxy:
 
             if bypass_warp:
                 header_params += "&warp=off"
+            if selected_proxy:
+                header_params += f"&proxy={urllib.parse.quote(selected_proxy)}"
 
             # 1. URL COMPLETO (Solo per il redirect)
             full_proxy_url = f"{proxy_base}{endpoint}?d={encoded_url}{header_params}"
@@ -2259,17 +2287,22 @@ class HLSProxy:
             logger.debug(f"   -> with headers: {headers}")
 
             # ✅ Use pooled session for better performance
-            # The session already has the proxy configured in its connector
+            forced_proxy = request.query.get("proxy") or None
+            bypass_warp = request.query.get("warp", "").lower() == "off"
+            
             if self._should_force_direct_from_query(request):
                 session = await self._get_session(url=key_url)
-                proxy_used = None
                 logger.debug("Using direct session for AES key request (forced)")
             else:
                 session, proxy_used = await self._get_proxy_session(
-                    key_url, bypass_warp=bypass_warp
+                    key_url, bypass_warp=bypass_warp, forced_proxy=forced_proxy
                 )
+                # ✅ LOG CRITICO: Deve essere info per apparire nei log standard
                 if proxy_used:
-                    logger.debug(f"Using pooled session with proxy: {proxy_used}")
+                    logger.info(f"🔑 [Key Proxy] Routing through: {proxy_used}")
+                else:
+                    logger.warning(f"🔑 [Key Proxy] NO PROXY assigned for: {key_url}")
+                    
             secret_key = headers.pop("X-Secret-Key", None)
 
             # Calcola X-Key-Timestamp, X-Key-Nonce, X-Fingerprint, e X-Key-Path se abbiamo la secret_key
@@ -2308,7 +2341,8 @@ class HLSProxy:
                     f"🔐 Auth key headers: Authorization={'***' if headers.get('Authorization') else 'missing'}, X-Channel-Key={headers.get('X-Channel-Key', 'missing')}, X-User-Agent={headers.get('X-User-Agent', 'missing')}"
                 )
 
-            async with session.get(key_url, headers=headers) as resp:
+            disable_ssl = get_ssl_setting_for_url(key_url, TRANSPORT_ROUTES)
+            async with session.get(key_url, headers=headers, ssl=not disable_ssl, allow_redirects=True, timeout=15) as resp:
                 if resp.status == 200 or resp.status == 206:
                     key_data = await resp.read()
                     logger.debug(
@@ -2430,12 +2464,15 @@ class HLSProxy:
 
             # ✅ Use pooled session for better performance
             bypass_warp = request.query.get("warp", "").lower() == "off"
+            forced_proxy = request.query.get("proxy") or None
+            
             session, _ = await self._get_proxy_session(
-                segment_url, bypass_warp=bypass_warp
+                segment_url, bypass_warp=bypass_warp, forced_proxy=forced_proxy
             )
+            disable_ssl = get_ssl_setting_for_url(segment_url, TRANSPORT_ROUTES)
             # ✅ Use yarl.URL with encoded=True to prevent double-encoding of commas
             final_segment_url = yarl.URL(segment_url, encoded=True)
-            async with session.get(final_segment_url, headers=headers) as resp:
+            async with session.get(final_segment_url, headers=headers, ssl=not disable_ssl) as resp:
                 response_headers = {}
 
                 for header in [
@@ -2498,10 +2535,13 @@ class HLSProxy:
             logger.error(f"Error in segment proxy: {str(e)}")
             return web.Response(text=f"Segment error: {str(e)}", status=500)
 
-    async def _proxy_stream(self, request, stream_url, stream_headers, bypass_warp=None):
+    async def _proxy_stream(self, request, stream_url, stream_headers, bypass_warp=None, forced_proxy=None):
         """Effettua il proxy dello stream con gestione manifest e AES-128"""
         if bypass_warp is None:
             bypass_warp = request.query.get("warp", "").lower() == "off"
+        
+        # Priorità: proxy passato esplicitamente -> proxy in query string
+        forced_proxy = forced_proxy or request.query.get("proxy") or None
         try:
             # Ping DLStreams extractor to keep browser alive during playback
             # Use robust markers: Daddy's domains, 'premium' pattern, 'mono.css', or Referer/Origin headers
@@ -2616,7 +2656,11 @@ class HLSProxy:
                     f"[Proxy Stream] Using direct session (forced) for: {stream_url}"
                 )
             else:
-                session, session_proxy = await self._get_proxy_session(stream_url, bypass_warp=bypass_warp)
+                session, session_proxy = await self._get_proxy_session(
+                    stream_url,
+                    bypass_warp=bypass_warp,
+                    forced_proxy=forced_proxy,
+                )
                 
                 # ✅ FIX LOG: Determine correct routing for display
                 if session_proxy:
@@ -2866,6 +2910,7 @@ class HLSProxy:
                         or "cccdn.net" in str(resp.url).lower()
                     )
                     
+                    disable_ssl = request.query.get("disable_ssl") == "1" or get_ssl_setting_for_url(str(resp.url), TRANSPORT_ROUTES)
                     rewritten = await ManifestRewriter.rewrite_manifest_urls(
                         manifest_content=manifest_content,
                         base_url=str(resp.url),
@@ -2876,7 +2921,9 @@ class HLSProxy:
                         get_extractor_func=self.get_extractor,
                         no_bypass=request.query.get("no_bypass") == "1",
                         shorten_url_func=self.shorten_hls_url if use_short_hls_urls else None,
-                        bypass_warp=bypass_warp
+                        bypass_warp=bypass_warp,
+                        disable_ssl=disable_ssl,
+                        selected_proxy=forced_proxy, # ✅ PASSA IL PROXY FORZATO
                     )
                     return web.Response(text=rewritten, headers={
                         "Content-Type": "application/vnd.apple.mpegurl",

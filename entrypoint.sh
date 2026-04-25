@@ -1,7 +1,8 @@
 #!/bin/bash
 export PYTHONPATH=/app
 
-WARP_EXCLUDED_HOSTS="${WARP_EXCLUDED_HOSTS:-cinemacity.cc,*.cinemacity.cc,cccdn.net,*.cccdn.net,strem.fun,*.strem.fun,torrentio.strem.fun,real-debrid.com,*.real-debrid.com,realdebrid.com,*.realdebrid.com,api.real-debrid.com,premiumize.me,*.premiumize.me,www.premiumize.me,alldebrid.com,*.alldebrid.com,api.alldebrid.com,debrid-link.com,*.debrid-link.com,debridlink.com,*.debridlink.com,api.debrid-link.com,torbox.app,*.torbox.app,api.torbox.app,offcloud.com,*.offcloud.com,api.offcloud.com,put.io,*.put.io,api.put.io,dlstreams.com,*.dlstreams.com,dlhd.dad,*.dlhd.dad}"
+WARP_EXCLUDED_HOSTS="${WARP_EXCLUDED_HOSTS:-cinemacity.cc,*.cinemacity.cc,cccdn.net,*.cccdn.net,strem.fun,*.strem.fun,torrentio.strem.fun,real-debrid.com,*.real-debrid.com,realdebrid.com,*.realdebrid.com,api.real-debrid.com,premiumize.me,*.premiumize.me,www.premiumize.me,alldebrid.com,*.alldebrid.com,api.alldebrid.com,debrid-link.com,*.debrid-link.com,debridlink.com,*.debridlink.com,api.debrid-link.com,torbox.app,*.torbox.app,api.torbox.app,offcloud.com,*.offcloud.com,api.offcloud.com,put.io,*.put.io,api.put.io}"
+WARP_LICENSE_KEY="${WARP_LICENSE_KEY:-}"
 
 # --- Cloudflare WARP Setup ---
 if [ "$ENABLE_WARP" = "true" ]; then
@@ -75,16 +76,13 @@ PROXY_VARS=""
 SOLVERS_FORCE_WARP_PROXY="${SOLVERS_FORCE_WARP_PROXY:-false}"
 if [ "$ENABLE_WARP" = "true" ] && [ "$SOLVERS_FORCE_WARP_PROXY" = "true" ]; then
     PROXY_VARS="HTTP_PROXY=socks5://127.0.0.1:1080 HTTPS_PROXY=socks5://127.0.0.1:1080 NO_PROXY=localhost,127.0.0.1"
-    echo "FlareSolverr/Byparr forced to use WARP SOCKS5 proxy globally: socks5://127.0.0.1:1080"
+    echo "FlareSolverr forced to use WARP SOCKS5 proxy globally: socks5://127.0.0.1:1080"
 else
-    echo "FlareSolverr/Byparr will use per-request routing from EasyProxy (supports real warp=off bypass)."
+    echo "FlareSolverr will use per-request routing from EasyProxy (supports real warp=off bypass)."
 fi
 
 echo "Starting FlareSolverr (v3 Python)..."
 cd /app/flaresolverr && eval $PROXY_VARS PORT=8191 python3 src/flaresolverr.py &
-
-echo "Starting Byparr..."
-cd /app/byparr_src && eval $PROXY_VARS PORT=8192 python3 main.py &
 
 echo "Starting EasyProxy..."
 cd /app
