@@ -1,16 +1,14 @@
+import asyncio
+import aiohttp
 import logging
 import random
 import re
 import socket
-import io
-from urllib.parse import urlparse, quote_plus
+from urllib.parse import urlparse
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
 from aiohttp.resolver import DefaultResolver
-from aiohttp_socks import ProxyConnector
-from bs4 import BeautifulSoup
-from config import GLOBAL_PROXIES, TRANSPORT_ROUTES, get_proxy_for_url, get_connector_for_proxy
+from config import FLARESOLVERR_TIMEOUT, FLARESOLVERR_URL, GLOBAL_PROXIES, TRANSPORT_ROUTES, get_proxy_for_url, get_connector_for_proxy, get_solver_proxy_url
 
-from utils.smart_request import smart_request
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +42,11 @@ class MaxstreamExtractor:
     def __init__(self, request_headers: dict, proxies: list = None):
         self.request_headers = request_headers
         self.base_headers = {
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             "accept-language": "en-US,en;q=0.9",
             "accept-encoding": "gzip, deflate",
-            "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"Windows"',
             "sec-fetch-dest": "document",
@@ -60,8 +58,9 @@ class MaxstreamExtractor:
         self.session = None
         self.mediaflow_endpoint = "hls_proxy"
         self.proxies = proxies or []
+        self.cookies = {} # Persistent cookies for the session
+        self.selected_proxy = None
         self.resolver = StaticResolver()
-
     def _get_random_proxy(self):
         return random.choice(self.proxies) if self.proxies else None
 
@@ -117,239 +116,202 @@ class MaxstreamExtractor:
             logger.debug(f"DoH resolution failed for {domain}: {e}")
         return []
 
-    async def _smart_request(self, url: str, method="GET", is_binary=False, **kwargs):
-        """Request with automatic retry using different proxies and resolver fallback on connection failure."""
-        last_error = None
+    async def _fetch(self, url: str, method="GET", is_binary=False, **kwargs):
+        """Request using direct/configured proxy routes only."""
+        if url.startswith("data:"):
+            import base64
+            try:
+                _, data = url.split(",", 1)
+                decoded = base64.b64decode(data)
+                return decoded if is_binary else decoded.decode("utf-8", errors="ignore")
+            except Exception as e:
+                logger.error(f"Failed to decode data URI: {e}")
+                return b"" if is_binary else ""
+
         parsed_url = urlparse(url)
         domain = parsed_url.netloc
-        
-        # Clear previous mapping for this domain to start fresh
-        self.resolver.mapping.pop(domain, None)
+        headers = kwargs.get("headers") or self.base_headers
+        post_data = kwargs.get("data")
+        paths = [{"proxy": None, "use_ip": None}]
+        for proxy in self._get_proxies_for_url(url):
+            paths.append({"proxy": proxy, "use_ip": None})
 
-        # Determine paths to try: Direct, Proxies, and then resolver override
-        paths = []
-        # Path 1: Direct (system DNS)
-        paths.append({"proxy": None, "use_ip": None})
-        
-        # Path 2: Proxies (route-specific first)
-        proxies_for_url = self._get_proxies_for_url(url)
-        if proxies_for_url:
-            for p in proxies_for_url:
-                paths.append({"proxy": p, "use_ip": None})
-        
-        # Path 3: DoH fallback (override resolver) if it's uprot or maxstream
-        if "uprot.net" in domain or "maxstream" in domain:
-            real_ips = await self._resolve_doh(domain)
-            for ip in real_ips[:2]: # Try first 2 IPs
+        if "maxstream" in domain:
+            for ip in (await self._resolve_doh(domain))[:2]:
                 paths.append({"proxy": None, "use_ip": ip})
-        
+
+        last_error = None
         for path in paths:
             proxy = path["proxy"]
-            use_ip = path["use_ip"]
-            
-            if use_ip:
-                # CRITICAL: Must destroy old session to flush TCPConnector DNS cache!
-                # Otherwise connector reuses cached (hijacked) IP even with new resolver mapping.
-                if self.session and not self.session.closed:
-                    await self.session.close()
-                    self.session = None
-                self.resolver.mapping[domain] = use_ip
-                logger.debug(f"DoH bypass: forcing {domain} -> {use_ip}")
-            else:
-                self.resolver.mapping.pop(domain, None)
+            local_resolver = StaticResolver()
+            if path["use_ip"]:
+                local_resolver.mapping[domain] = path["use_ip"]
 
-            session = await self._get_session(proxy=proxy)
+            timeout = ClientTimeout(total=25, connect=10, sock_read=20)
+            connector = get_connector_for_proxy(proxy) if proxy else TCPConnector(resolver=local_resolver, ssl=False)
             try:
-                async with session.request(method, url, **kwargs) as response:
-                    if response.status < 400:
-                        if is_binary:
-                            content = await response.read()
-                            if proxy: await session.close()
-                            return content
-                        text = await response.text()
-                        
-                        # Check for Cloudflare challenge in successful response
-                        if any(marker in text.lower() for marker in ["cf-challenge", "ray id", "checking your browser"]):
-                            logger.warning(f"Cloudflare detected on {url} (Proxy: {proxy}), trying FlareSolverr fallback...")
-                            # Fallback to the global smart_request utility
-                            if proxy: await session.close()
-                            fs_cmd = f"request.{method.lower()}"
-                            result = await smart_request(fs_cmd, url, headers=kwargs.get("headers"), post_data=kwargs.get("data"), proxies=self.proxies)
-                            return result.get("html", "") if isinstance(result, dict) else result
-
-                        if proxy: await session.close()
-                        return text
-                    elif response.status in (403, 503):
-                        # Might be Cloudflare block, try FlareSolverr immediately for this path
-                        logger.warning(f"HTTP {response.status} on {url}, checking with FlareSolverr...")
-                        if proxy: await session.close()
-                        fs_cmd = f"request.{method.lower()}"
-                        result = await smart_request(fs_cmd, url, headers=kwargs.get("headers"), post_data=kwargs.get("data"), proxies=self.proxies)
-                        return result.get("html", "") if isinstance(result, dict) else result
-                    else:
-                        logger.warning(f"Request to {url} failed (Status {response.status}) [Proxy: {proxy}, StaticIP: {use_ip}]")
+                async with ClientSession(timeout=timeout, connector=connector, headers=self.base_headers) as session:
+                    call_kwargs = kwargs.copy()
+                    if self.cookies:
+                        call_kwargs["cookies"] = self.cookies
+                    async with session.request(method, url, ssl=False, **call_kwargs) as response:
+                        response.raise_for_status()
+                        self.selected_proxy = proxy
+                        for k, v in response.cookies.items():
+                            self.cookies[k] = v.value
+                        return await response.read() if is_binary else await response.text()
             except Exception as e:
-                logger.warning(f"Request to {url} failed (Error: {e}) [Proxy: {proxy}, StaticIP: {use_ip}]")
                 last_error = e
-                # If DoH attempt failed, destroy session so next IP gets fresh connector
-                if use_ip and self.session and not self.session.closed:
-                    await self.session.close()
-                    self.session = None
-            finally:
-                if proxy and 'session' in locals() and not session.closed:
-                    await session.close()
-        
-        raise ExtractorError(f"Connection failed for {url} after trying all paths. Last error: {last_error}")
+                logger.debug(f"Path failed ({proxy or 'direct'}): {e}")
 
-    async def _solve_uprot_captcha(self, text: str, original_url: str) -> str:
-        """Find, download and solve captcha on uprot page."""
+        if not is_binary and "maxstream.video" in domain:
+            cffi_result = await self._fetch_with_curl_cffi(
+                url,
+                method=method,
+                headers=headers,
+                data=post_data,
+            )
+            if cffi_result:
+                return cffi_result
+
+            fs_result = await self._fetch_with_flaresolverr(url, method=method, headers=headers, post_data=post_data)
+            if fs_result:
+                return fs_result
+
+        raise ExtractorError(f"Connection failed for {url}: {last_error}")
+
+    async def _fetch_with_curl_cffi(self, url: str, method="GET", headers=None, data=None):
         try:
-            import ddddocr
+            from curl_cffi import requests as cffi_requests
         except ImportError:
-            logger.error("ddddocr not installed. Cannot solve captcha.")
-            return None
-            
-        soup = BeautifulSoup(text, "lxml")
-        img_tag = soup.find("img", src=re.compile(r'/captcha|/image/'))
-        form = soup.find("form")
-        
-        if not img_tag or not form:
-            return None
-            
-        captcha_url = img_tag["src"]
-        if captcha_url.startswith("/"):
-            parsed = urlparse(original_url)
-            captcha_url = f"{parsed.scheme}://{parsed.netloc}{captcha_url}"
-            
-        logger.debug(f"Downloading captcha from: {captcha_url}")
-        img_data = await self._smart_request(captcha_url, is_binary=True)
-        
-        if not img_data:
-            return None
-            
-        # Initialize ddddocr (lazy init for performance)
-        if not hasattr(self, '_ocr_engine'):
-            self._ocr_engine = ddddocr.DdddOcr(show_ad=False)
-            
-        # Solve
-        res = self._ocr_engine.classification(img_data)
-        logger.debug(f"Captcha solved: {res}")
-        
-        # Submit form
-        form_action = form.get("action", "")
-        if not form_action or form_action == "#":
-            form_action = original_url
-        elif form_action.startswith("/"):
-            parsed = urlparse(original_url)
-            form_action = f"{parsed.scheme}://{parsed.netloc}{form_action}"
-            
-        # Prepare data (find the captcha input name)
-        captcha_input = soup.find("input", {"name": re.compile(r'captcha|code|val', re.I)})
-        if not captcha_input:
-            # Fallback to common names
-            field_name = "captcha"
-        else:
-            field_name = captcha_input["name"]
-            
-        post_data = {field_name: res}
-        # Add other hidden fields
-        for hidden in form.find_all("input", type="hidden"):
-            if hidden.get("name"):
-                post_data[hidden["name"]] = hidden.get("value", "")
-        
-        logger.debug(f"Submitting captcha to: {form_action}")
-        headers = {**self.base_headers, "referer": original_url}
-        solved_text = await self._smart_request(form_action, method="POST", data=post_data, headers=headers)
-        
-        # Try to parse the new page
-        try:
-            return self._parse_uprot_html(solved_text)
-        except:
+            logger.debug("curl_cffi not installed, skipping Maxstream browser request")
             return None
 
-    def _parse_uprot_html(self, text: str) -> str:
-        """Parse uprot HTML to extract redirect link."""
-        # 1. Look for direct links in text (including escaped slashes)
-        match = re.search(r'https?://(?:www\.)?(?:stayonline\.pro|maxstream\.video)[^"\'\s<>\\ ]+', text.replace("\\/", "/"))
-        if match:
-            return match.group(0)
-            
-        # 2. Look for JavaScript-based redirects
-        js_match = re.search(r'window\.location(?:\.href)?\s*=\s*["\']([^"\']+)["\']', text)
-        if js_match:
-            return js_match.group(1)
-            
-        # 3. Look for Meta refresh
-        meta_match = re.search(r'content=["\']0;\s*url=([^"\']+)["\']', text, re.I)
-        if meta_match:
-            return meta_match.group(1)
-            
-        # 4. Use BeautifulSoup for interactive elements
-        soup = BeautifulSoup(text, "lxml")
-        
-        # Look for Bulma-style buttons or links with "Continue" text
-        for btn in soup.find_all(["a", "button"]):
-            text_content = btn.get_text().strip().lower()
-            if "continue" in text_content or "continua" in text_content or "vai al" in text_content:
-                href = btn.get("href")
-                if not href and btn.parent.name == "a":
-                    href = btn.parent.get("href")
-                
-                if href and "uprot" not in href:
-                    return href
-        
-        # Specific Bulma selectors
-        for selector in ['a[href*="maxstream"]', 'a[href*="stayonline"]', '.button.is-info', '.button.is-success', 'a.button']:
-            tag = soup.select_one(selector)
-            if tag and tag.get("href") and "uprot" not in tag["href"]:
-                return tag["href"]
-        
-        # If it's a form
-        form = soup.find("form")
-        if form and form.get("action") and "uprot" not in form["action"]:
-            return form["action"]
-            
+        proxies = [None] + self._get_proxies_for_url(url)
+        request_headers = dict(headers or self.base_headers)
+        loop = asyncio.get_running_loop()
+
+        def do_request(proxy, profile):
+            try:
+                proxies_arg = {"http": proxy, "https": proxy} if proxy else None
+                response = cffi_requests.request(
+                    method,
+                    url,
+                    headers=request_headers,
+                    data=data,
+                    cookies=self.cookies or None,
+                    proxies=proxies_arg,
+                    impersonate=profile,
+                    timeout=30,
+                    allow_redirects=True,
+                    verify=False,
+                )
+                cookies = {}
+                try:
+                    cookies = {cookie.name: cookie.value for cookie in response.cookies.jar}
+                except Exception:
+                    cookies = dict(response.cookies) if response.cookies else {}
+                return response.status_code, response.text, cookies, proxy, profile
+            except Exception as exc:
+                logger.debug(f"curl_cffi maxstream error for {url}: proxy={proxy or 'direct'} profile={profile}: {exc}")
+                return 0, None, {}, proxy, profile
+
+        for proxy in proxies:
+            for profile in ("chrome131", "chrome124", "edge101"):
+                status, text, cookies, used_proxy, used_profile = await loop.run_in_executor(None, do_request, proxy, profile)
+                if cookies:
+                    self.cookies.update(cookies)
+                if status < 400 and text:
+                    self.selected_proxy = used_proxy
+                    logger.debug(f"curl_cffi maxstream success via {used_proxy or 'direct'} profile={used_profile}")
+                    return text
+                logger.debug(f"curl_cffi maxstream failed for {url}: status={status} proxy={used_proxy or 'direct'} profile={used_profile}")
         return None
 
-    async def get_uprot(self, link: str):
-        """Extract MaxStream URL from uprot redirect."""
-        # Fix link type
-        link = link.replace("msf", "mse")
-        
-        # Direct request (user should provide non-datacenter proxy in GLOBAL_PROXY)
-        text = await self._smart_request(link)
-        
-        # 1. Try normal parse
-        res = self._parse_uprot_html(text)
-        if res:
-            return res
-            
-        # 2. If no link, try puzzle/captcha solver
-        logger.debug("Direct link not found, checking for captcha...")
-        res = await self._solve_uprot_captcha(text, link)
-        if res:
-            return res
-            
-        # If we see "Cloudflare" or "Challenge" in text, it's a block
-        if "cf-challenge" in text or "ray id" in text.lower() or "checking your browser" in text.lower():
-            raise ExtractorError("Cloudflare block (Browser check/Challenge)")
-            
-        logger.error(f"Uprot Parse Failure. Content: {text[:2000]}...")
-        raise ExtractorError("Redirect link not found in uprot page")
+    async def _fetch_with_flaresolverr(self, url: str, method="GET", headers=None, post_data=None):
+        if not FLARESOLVERR_URL:
+            logger.debug("FlareSolverr not configured, skipping Maxstream browser fallback")
+            return None
+
+        proxy = next(iter(self._get_proxies_for_url(url)), None)
+        payload = {
+            "cmd": f"request.{method.lower()}",
+            "url": url,
+            "maxTimeout": (FLARESOLVERR_TIMEOUT + 60) * 1000,
+        }
+        if post_data:
+            payload["postData"] = post_data
+
+        fs_headers = {}
+        if proxy:
+            payload["proxy"] = {"url": proxy}
+            fs_headers["X-Proxy-Server"] = get_solver_proxy_url(proxy)
+
+        cookie_header = (headers or {}).get("Cookie") or (headers or {}).get("cookie")
+        if cookie_header:
+            parsed = urlparse(url)
+            payload["cookies"] = [
+                {
+                    "name": key.strip(),
+                    "value": value.strip(),
+                    "domain": parsed.hostname,
+                    "path": "/",
+                    "secure": parsed.scheme == "https",
+                }
+                for item in cookie_header.split(";")
+                if "=" in item
+                for key, value in [item.split("=", 1)]
+            ]
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{FLARESOLVERR_URL.rstrip('/')}/v1",
+                    json=payload,
+                    headers=fs_headers,
+                    timeout=ClientTimeout(total=FLARESOLVERR_TIMEOUT + 95),
+                ) as response:
+                    data = await response.json()
+        except Exception as exc:
+            logger.debug(f"FlareSolverr maxstream failed for {url}: {exc}")
+            return None
+
+        if data.get("status") != "ok":
+            logger.debug(f"FlareSolverr maxstream error for {url}: {data.get('message')}")
+            return None
+
+        solution = data.get("solution", {})
+        cookies = {c["name"]: c["value"] for c in solution.get("cookies", [])}
+        if cookies:
+            self.cookies.update(cookies)
+        html = solution.get("response", "")
+        if html and not any(marker in html.lower() for marker in ("just a moment", "cf-challenge", "checking your browser")):
+            self.selected_proxy = proxy
+            return html
+        logger.debug("FlareSolverr maxstream returned Cloudflare challenge or empty response")
+        return None
 
     async def extract(self, url: str, **kwargs) -> dict:
-        """Extract Maxstream URL."""
-        maxstream_url = await self.get_uprot(url)
+        """Extract Maxstream URL.
+
+        For /msfld/ folder URLs, callers must pass season=N&episode=M as
+        query parameters (forwarded by MFP routes as kwargs).
+        """
+        input_domain = urlparse(url).netloc.lower()
+        if "maxstream.video" not in input_domain:
+            raise ExtractorError("Maxstream: redirector URLs are no longer supported")
+        maxstream_url = url
         logger.debug(f"Target URL: {maxstream_url}")
         
         # Use strict headers to avoid Error 131
         headers = {
             **self.base_headers,
-            "referer": "https://uprot.net/",
+            "referer": "https://maxstream.video/",
+            "origin": "https://maxstream.video",
             "accept-language": "en-US,en;q=0.5"
         }
         
-        text = await self._smart_request(maxstream_url, headers=headers)
+        text = await self._fetch(maxstream_url, headers=headers)
         
         # Direct sources check
         direct_match = re.search(r'sources:\s*\[\{src:\s*"([^"]+)"', text)
@@ -358,6 +320,7 @@ class MaxstreamExtractor:
                 "destination_url": direct_match.group(1),
                 "request_headers": {**self.base_headers, "referer": maxstream_url},
                 "mediaflow_endpoint": self.mediaflow_endpoint,
+                "selected_proxy": self.selected_proxy,
             }
 
         # Fallback to packer logic
@@ -419,6 +382,7 @@ class MaxstreamExtractor:
             "destination_url": final_url,
             "request_headers": self.base_headers,
             "mediaflow_endpoint": self.mediaflow_endpoint,
+            "selected_proxy": self.selected_proxy,
         }
 
     async def close(self):

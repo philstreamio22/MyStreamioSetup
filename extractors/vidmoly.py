@@ -1,41 +1,12 @@
-import logging
-import random
 import re
 from urllib.parse import urljoin, urlparse
-from aiohttp import ClientSession, ClientTimeout, TCPConnector
-from aiohttp_socks import ProxyConnector
-from config import get_proxy_for_url, TRANSPORT_ROUTES, get_connector_for_proxy
+from extractors.base import BaseExtractor, ExtractorError
 
-logger = logging.getLogger(__name__)
-
-class ExtractorError(Exception):
-    pass
-
-class VidmolyExtractor:
+class VidmolyExtractor(BaseExtractor):
     """Vidmoly URL extractor."""
 
     def __init__(self, request_headers: dict, proxies: list = None):
-        self.request_headers = request_headers
-        self.base_headers = {
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
-        }
-        self.session = None
-        self.mediaflow_endpoint = "hls_proxy"
-        self.proxies = proxies or []
-
-    def _get_random_proxy(self):
-        return random.choice(self.proxies) if self.proxies else None
-
-    async def _get_session(self, url: str = None):
-        if self.session is None or self.session.closed:
-            timeout = ClientTimeout(total=60, connect=30, sock_read=30)
-            proxy = get_proxy_for_url(url, TRANSPORT_ROUTES, self.proxies) if url else self._get_random_proxy()
-            if proxy:
-                connector = get_connector_for_proxy(proxy)
-            else:
-                connector = TCPConnector(limit=0, limit_per_host=0, keepalive_timeout=60, enable_cleanup_closed=True, force_close=False, use_dns_cache=True)
-            self.session = ClientSession(timeout=timeout, connector=connector, headers={'User-Agent': self.base_headers["user-agent"]})
-        return self.session
+        super().__init__(request_headers, proxies, extractor_name="vidmoly")
 
     async def extract(self, url: str, **kwargs) -> dict:
         """Extract Vidmoly URL."""
@@ -43,40 +14,43 @@ class VidmolyExtractor:
         if not parsed.hostname or "vidmoly" not in parsed.hostname:
             raise ExtractorError("VIDMOLY: Invalid domain")
 
-        session = await self._get_session(url)
-        
+        # Extract embed ID from URL path, e.g. /embed-qu2swicnn9j6.html -> qu2swicnn9j6
+        embed_id_match = re.search(r'/embed-([a-zA-Z0-9]+)\.html', parsed.path)
+        if not embed_id_match:
+            raise ExtractorError("VIDMOLY: Could not extract embed ID from URL")
+        embed_id = embed_id_match.group(1)
+
         headers = {
-            "User-Agent": self.base_headers["user-agent"],
+            "User-Agent": self.base_headers["User-Agent"],
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Connection": "keep-alive",
+            "Cookie": f"cf_turnstile_demo_pass_{embed_id}=1",
             "Referer": url,
-            "Sec-Fetch-Dest": "iframe",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
         }
 
         # --- Fetch embed page ---
-        async with session.get(url, headers=headers) as response:
-            html = await response.text()
+        resp = await self._make_request(url, headers=headers)
+        html = resp.text
 
         # --- Extract master m3u8 ---
-        match = re.search(r'sources:\s*\[{file:"([^"]+)', html)
+        match = re.search(r'sources\s*:\s*\[\s*\{\s*file\s*:\s*[\'"]([^\'"]+)', html)
         if not match:
             raise ExtractorError("VIDMOLY: Stream URL not found")
 
         master_url = match.group(1)
-
         if not master_url.startswith("http"):
             master_url = urljoin(url, master_url)
 
-        # --- Validate stream (prevents Stremio timeout) ---
+        # --- Validate stream ---
         try:
-            async with session.get(master_url, headers=headers) as test:
-                if test.status >= 400:
-                    raise ExtractorError(f"VIDMOLY: Stream unavailable ({test.status})")
-        except Exception as e:
-            if "timeout" in str(e).lower():
-                raise ExtractorError("VIDMOLY: Request timed out")
-            raise
+            await self._make_request(master_url, headers=headers)
+        except ExtractorError as e:
+            raise ExtractorError(f"VIDMOLY: Stream unavailable or timed out: {e}")
 
-        # Return MASTER playlist, not variant
-        # Let MediaFlow Proxy handle variants
         return {
             "destination_url": master_url,
             "request_headers": headers,
