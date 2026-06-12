@@ -452,16 +452,7 @@ class HLSProxyCoreMixin:
 
         # Fallback: wireproxy mode — kill, re-register, restart
         warp_dir = os.environ.get("WARP_DIR", "/tmp/easyproxy-warp")
-        try:
-            # Kill existing wireproxy
-            proc = await asyncio.create_subprocess_exec(
-                "pkill", "-9", "wireproxy",
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-            )
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        except (FileNotFoundError, asyncio.TimeoutError):
-            pass
-
+        _kill_wireproxy()
         await asyncio.sleep(1)
 
         try:
@@ -532,12 +523,13 @@ class HLSProxyCoreMixin:
         return result
 
     async def _stop_warp_proxy(self):
-        for cmd in [["warp-cli", "--accept-tos", "disconnect"], ["pkill", "-9", "wireproxy"]]:
+        for cmd in [["warp-cli", "--accept-tos", "disconnect"]]:
             try:
                 proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
                 await asyncio.wait_for(proc.wait(), timeout=5)
             except Exception:
                 pass
+        _kill_wireproxy()
 
     async def _update_latest_version(self):
         """Periodically checks GitHub for the latest version in the background."""
@@ -1021,3 +1013,18 @@ async def _warp_cli_connect() -> bool:
         return False
     except (FileNotFoundError, asyncio.TimeoutError):
         return False
+
+def _kill_wireproxy():
+    """Kill wireproxy by scanning /proc."""
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/comm") as f:
+                    if "wireproxy" in f.read():
+                        os.kill(int(entry), 9)
+            except (OSError, ProcessLookupError):
+                pass
+    except Exception:
+        pass
