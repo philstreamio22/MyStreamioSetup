@@ -38,6 +38,64 @@ def _patch_client_session_for_upstream_bytes():
 
 _patch_client_session_for_upstream_bytes()
 
+
+# Monkey-patch curl_cffi Response to count upstream response bytes.
+# This covers extractors and any other code that uses curl_cffi instead of aiohttp.
+def _patch_curl_cffi_for_upstream_bytes():
+    try:
+        from curl_cffi.requests.models import Response
+        from config import record_proxy_net_recv
+    except Exception:
+        return
+
+    # .content property
+    _orig_content_getter = Response.content.fget
+
+    @property
+    def _content(self):
+        data = _orig_content_getter(self)
+        if data:
+            record_proxy_net_recv(len(data))
+        return data
+
+    Response.content = _content
+
+    # async full content read
+    _orig_acontent = Response.acontent
+
+    async def _acontent(self, *args, **kwargs):
+        data = await _orig_acontent(self, *args, **kwargs)
+        if data:
+            record_proxy_net_recv(len(data))
+        return data
+
+    Response.acontent = _acontent
+
+    # async streaming iterator
+    _orig_aiter_content = Response.aiter_content
+
+    async def _aiter_content(self, *args, **kwargs):
+        async for chunk in _orig_aiter_content(self, *args, **kwargs):
+            if chunk:
+                record_proxy_net_recv(len(chunk))
+            yield chunk
+
+    Response.aiter_content = _aiter_content
+
+    # sync streaming iterator (if used anywhere)
+    _orig_iter_content = Response.iter_content
+
+    def _iter_content(self, *args, **kwargs):
+        for chunk in _orig_iter_content(self, *args, **kwargs):
+            if chunk:
+                record_proxy_net_recv(len(chunk))
+            yield chunk
+
+    Response.iter_content = _iter_content
+
+
+_patch_curl_cffi_for_upstream_bytes()
+
 # Configura logging PRIMA di qualsiasi import che possa emettere log
 logging.basicConfig(
     level=logging.INFO,
