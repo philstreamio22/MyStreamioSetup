@@ -228,12 +228,21 @@ class MPDToHLSConverter:
             
             root = ET.fromstring(manifest_content)
             lines = ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-INDEPENDENT-SEGMENTS']
-            
+
+            # Multi-Period live MPD: track IDs repeat in every Period.
+            # Iterating './/' concatenates all Periods -> duplicate
+            # EXT-X-MEDIA/STREAM-INF and stale timelines. For dynamic
+            # (live) use the last Period (live edge); static VOD keeps
+            # the full manifest. Single-Period manifests are unaffected.
+            periods = root.findall('mpd:Period', self.ns)
+            is_live_master = (root.get('type', 'static') or '').lower() == 'dynamic'
+            scope = periods[-1] if (is_live_master and len(periods) > 1) else root
+
             # Trova AdaptationSet Video e Audio
             video_sets = []
             audio_sets = []
-            
-            for adaptation_set in root.findall('.//mpd:AdaptationSet', self.ns):
+
+            for adaptation_set in scope.findall('.//mpd:AdaptationSet', self.ns):
                 mime_type = adaptation_set.get('mimeType', '')
                 content_type = adaptation_set.get('contentType', '')
                 
@@ -268,7 +277,7 @@ class MPDToHLSConverter:
                     'mp4a', 'aac', 'ac-3', 'ec-3', 'opus', 'vorbis'
                 ))
 
-            for adaptation_set in root.findall('.//mpd:AdaptationSet', self.ns):
+            for adaptation_set in scope.findall('.//mpd:AdaptationSet', self.ns):
                 representations = adaptation_set.findall('mpd:Representation', self.ns)
                 if (
                     adaptation_set not in video_sets
@@ -477,6 +486,8 @@ class MPDToHLSConverter:
         lines = ['#EXTM3U', '#EXT-X-VERSION:6']
         if not is_live:
             lines.append('#EXT-X-PLAYLIST-TYPE:VOD')
+        else:
+            lines.append('#EXT-X-START:TIME-OFFSET=-18.0')
         lines.append(f'#EXT-X-TARGETDURATION:{max(1, int(max(durations)) + 1)}')
         lines.append('#EXT-X-MEDIA-SEQUENCE:0')
 
@@ -543,8 +554,10 @@ class MPDToHLSConverter:
             representation = None
             adaptation_set = None
             
-            # Cerca in tutti gli AdaptationSet
-            for aset in root.findall('.//mpd:AdaptationSet', self.ns):
+            # Trova la Representation specifica: a Periodi multipli gli stessi
+            # id si ripetono; la prima occorrenza è il Period più vecchio
+            # (scaduto). Cerca dal Period più recente.
+            for aset in reversed(root.findall('.//mpd:AdaptationSet', self.ns)):
                 rep = aset.find(f'mpd:Representation[@id="{rep_id}"]', self.ns)
                 if rep is not None:
                     representation = rep
@@ -568,7 +581,12 @@ class MPDToHLSConverter:
             # fMP4 richiede HLS versione 6 o 7, ma per .ts output usiamo v3 per compatibilità
             # Per LIVE: non usare VOD e non aggiungere ENDLIST
             if is_live:
-                lines = ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-INDEPENDENT-SEGMENTS']
+                lines = [
+                    '#EXTM3U',
+                    '#EXT-X-VERSION:3',
+                    '#EXT-X-INDEPENDENT-SEGMENTS',
+                    '#EXT-X-START:TIME-OFFSET=-18.0',
+                ]
             else:
                 # Target duration is emitted once below from the actual segment
                 # durations.  A duplicate tag makes some HLS.js versions treat
@@ -607,7 +625,7 @@ class MPDToHLSConverter:
                     if is_null_key:
                         # Chiave nulla: usa comunque l'endpoint decrypt per il remux a TS
                         # ma aggiungi flag per saltare la decrittazione vera e propria
-                        logger.debug(f"🔓 Null key detected - using remux endpoint without decryption")
+                        logger.debug("🔓 Null key detected - using remux endpoint without decryption")
                         server_side_decryption = True
                         drm_token = next(
                             (
@@ -648,7 +666,7 @@ class MPDToHLSConverter:
                  ext_param = "ts"
             
             if ext_param == "ts" and not server_side_decryption:
-                 logger.debug(f"🔄 Concatenation requested (ext=ts)")
+                 logger.debug("🔄 Concatenation requested (ext=ts)")
                  server_side_decryption = True
                  # Use dummy key/id to satisfy the endpoint requirement, and set skip_decrypt=1
                  decryption_params = "&key=00000000000000000000000000000000&key_id=00000000000000000000000000000000&skip_decrypt=1"
@@ -837,7 +855,6 @@ class MPDToHLSConverter:
                         if not segments_to_use:
                             segments_to_use = [all_segments[-1]]
 
-                        total_duration = sum(seg['duration'] for seg in segments_to_use)
                         max_duration = max(seg['duration'] for seg in segments_to_use)
                         if segments_to_use:
                             if has_explicit_start_number:

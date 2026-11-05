@@ -22,6 +22,17 @@ A powerful, lightweight proxy server designed to handle HLS, M3U8, and DASH (MPD
 
 ## 🚀 Quick Start
 
+### 🪟 Windows (Standalone Executable - Recommended on Windows)
+On Windows **nothing needs to be installed** (no Python, no Docker, no external tools):
+1. Download **`EasyProxy-windows-amd64.zip`** from the [Releases](https://github.com/realbestia1/EasyProxy/releases/latest) section.
+2. Extract the ZIP into a folder of your choice.
+3. Launch **`EasyProxy.exe`**.
+4. Open the dashboard in your browser at **`http://localhost:7860`**.
+
+> All required components are preconfigured and bundled: Wireproxy (WARP/WireGuard), Tor (Snowflake) and FlareSolverr (portable Chromium with automatic Turnstile solving).
+>
+> 🔄 **Built-in auto-update**: `EasyProxy.exe` updates itself with one click from the Web control panel (`/admin`) as soon as a new version is released on GitHub, or from a terminal with `EasyProxy.exe --update`.
+
 ### 🐳 Docker (Recommended)
 The Docker image includes EasyProxy plus integrated CF Turnstile Solver for maximum compatibility. 
 
@@ -31,33 +42,10 @@ To run the container and persist config/recordings on your host machine, mount t
 docker run -d -p 7860:7860 -v ./data:/data --name EasyProxy ghcr.io/realbestia1/easyproxy:latest
 ```
 
-### 🐍 Python (Local)
-
-#### Prerequisites (All Platforms)
-- **Python 3.11+**
-- **Git** (for cloning dependencies)
-
-#### 🪟 Windows Setup
-The easiest way to get EasyProxy plus solvers on Windows:
-1. Clone the repository and enter the folder.
-2. Run **`start_full.bat`**.
-*This script automatically handles CF Turnstile Solver, patches, and dependencies.*
-
-#### 🐧 Linux / macOS Setup
-1. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-2. **Start EasyProxy**:
-   ```bash
-   python app.py
-   ```
-#### 📱 Termux (Android)
+### 📱 Termux (Android)
 EasyProxy plus solvers is fully supported on Android via Termux + Ubuntu proot.
 
 The setup supports proot-distro 5 and earlier releases, and installs Python dependencies in an isolated virtual environment at `/root/EasyProxy/.venv`.
-
-Android users can also install the APK build if they prefer a simpler app-style setup. The APK is convenient, but it is not as complete as the Python/Termux version, so Termux remains the recommended option for full functionality.
 
 For Termux, full functionality requires a 64-bit Android device. On 32-bit devices, some components and solvers may not work.
 
@@ -99,6 +87,7 @@ easyproxy-update
 
 | Method | Description |
 | :--- | :--- |
+| **Windows Standalone** | Portable, self-contained executable (`EasyProxy.exe`) with Tor, WARP and FlareSolverr bundled. No prerequisites. |
 | **Docker** | Standard `docker build .` uses the single `Dockerfile` with solvers included. |
 | **Docker Compose** | Run the complete stack (Proxy + Solvers) with `docker-compose up -d`. |
 | **HuggingFace** | Use `Dockerfile-hf` for seamless deployment on HF Spaces. |
@@ -126,46 +115,43 @@ sysctl.
 
 You can enable and configure WARP, customize the excluded domains list, and enter your license key directly from the **Admin Panel**.
 
-### 🧭 NordVPN, custom WireGuard & TorProxy
-Besides WARP, EasyProxy can run extra local SOCKS5 proxies:
+### 🧭 NordVPN, Custom WireGuard & TorProxy
 
-| Panel | Profile source | Default SOCKS5 endpoint |
+EasyProxy supports multiple local SOCKS5 proxies running in parallel alongside Cloudflare WARP (`127.0.0.1:1080`). Each service runs its own isolated process, port, and log stream. Bind addresses can be customized directly in the panel.
+
+| Panel | Profile Source | Default Endpoint |
 | :--- | :--- | :--- |
-| `/admin/nordvpn` | NordLynx profile generated from your NordVPN access token and the server you pick | `socks5h://127.0.0.1:1081` |
-| `/admin/wireguard` | Any WireGuard profile pasted into the panel | `socks5h://127.0.0.1:1082` |
+| `/admin/nordvpn` | NordLynx profile generated via NordVPN access token | `socks5h://127.0.0.1:1081` |
+| `/admin/wireguard` | Custom pasted WireGuard configuration | `socks5h://127.0.0.1:1082` |
 | `/admin/torproxy` | Tor client managed by EasyProxy | `socks5h://127.0.0.1:9050` |
 
-WARP keeps `127.0.0.1:1080`; each tunnel has its own process, port and log,
-so they can run in parallel. Bind addresses are editable in their panels.
+---
 
-Tor is installed in the Docker image and starts only after enabling it from
-`/admin/torproxy`. Automatic circuit rotation is disabled as far as Tor allows
-(30-day maximum circuit lifetime); use **Request new IP** for manual `NEWNYM`.
-An exit can still change after a failure or process restart. The panel includes
-start/stop, manual identity change, Tor egress check and logs. **Exit country**
-is a list loaded live from Tor (onionoo) with only the countries currently
-running exit relays; picking one pins the relay Tor selects in that country, so
-the egress IP stays fixed until **Request new IP**, which picks another relay
-in the same country. Tor is TCP-only and should normally be used on selected
-routes rather than as the default for all streaming traffic.
+#### 🧅 Tor Features & Behavior
+* **On-Demand:** Pre-installed; starts only when activated from `/admin/torproxy`.
+* **Static Circuits:** Automatic rotation is suppressed up to Tor's 30-day limit. Click **Request new IP** for a manual `NEWNYM`.
+* **Geo-Pinning:** Live country lists are fetched via Onionoo. Selecting an exit country pins the circuit to that country until manually refreshed.
+* **Use Case:** TCP-only. Best suited for specific route targeting rather than primary streaming traffic.
 
-In the Admin Panel speed test, **Direct** uses Ookla. Every proxy route uses a
-real SOCKS5/HTTP proxied TCP throughput test, shows the egress IP, and does not
-fall back to the direct connection. Proxy routes run one 10-second download and
-one 10-second upload sample.
+#### ⚡ Route Speed Testing
+Admin speed tests perform real TCP throughput measurements via `curl` across all routes (including **Direct**):
+* Displays verified egress IP.
+* Strictly avoids fallback to alternative routes.
+* Runs dedicated 10-second download and 10-second upload tests per route.
 
-Reference the endpoint from **Global Proxies**, a **Transport Route** or an extractor
-proxy to route EasyProxy traffic through it. TCP only: the SOCKS5 endpoint cannot
-carry UDP. A missing `DNS`, `MTU` and `PersistentKeepalive` in a pasted profile is
-filled with `1.1.1.1`, `1420` and `25`; IPv6 entries and wg-quick-only directives
-(`Table`, `PostUp`, ...) are stripped before the tunnel starts.
+#### ⚙️ WireGuard Profile Parsing
+Pasted profiles are auto-sanitized before the interface is created:
+* **Missing parameters filled:** `DNS` (`1.1.1.1`), `MTU` (`1420`), `PersistentKeepalive` (`25`).
+* **Stripped elements:** IPv6 addresses and `wg-quick` directives (`Table`, `PostUp`, `PostDown`, etc.).
+* **Limitation:** Endpoints are strictly TCP-only (UDP is not proxied).
 
-### 🧩 VixSrc FlareSolverr
-The Docker image also contains FlareSolverr, Chromium, and Xvfb. FlareSolverr is
-not started at EasyProxy startup: VixSrc launches it only after detecting a
-Cloudflare challenge, passes the currently selected proxy/WARP route, imports
-the returned cookies and User-Agent, then terminates the process immediately.
-When WARP is active, a missing solver route fails closed instead of using direct.
+
+### 🧩 FlareSolverr
+The Docker image includes FlareSolverr, Chromium, and Xvfb, operating entirely on-demand to optimize resource usage:
+* **On-Demand Execution:** Launched only when a Cloudflare challenge is detected, and terminates immediately after completion.
+* **Route Integration:** Inherits the currently selected proxy or WARP route.
+* **Session Handover:** Automatically captures and applies the resulting cookies and User-Agent.
+* **Fail-Closed Security:** If WARP is active and the solver route is unavailable, requests fail closed rather than falling back to a direct connection.
 
 ---
 

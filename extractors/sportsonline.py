@@ -9,21 +9,15 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse, urljoin
 from typing import Dict, Any
-import random
 import aiohttp
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
 from aiohttp.client_exceptions import ClientOSError
 from config import get_connector_for_proxy, get_preferred_proxy_for_url
 import config as _cfg
-from extractors.base import BaseExtractor, ExtractorError
+from extractors.base import BaseExtractor, ExtractorError, RateLimitError
 
 
 logger = logging.getLogger(__name__)
-
-
-class RateLimitError(ExtractorError):
-    """Upstream returned HTTP 429; use cached data/backoff when available."""
-    pass
 
 
 def unpack(p, a, c, k, e=None, d=None):
@@ -121,9 +115,6 @@ class SportsonlineExtractor(BaseExtractor):
         deadline = self._host_backoff.get(self._host_of(url), 0.0)
         return max(0.0, deadline - time.monotonic())
 
-    def _get_random_proxy(self):
-        return random.choice(self.proxies) if self.proxies else None
-
     def update_request_headers(self, request_headers: dict | None):
         self.request_headers = request_headers or {}
 
@@ -193,18 +184,6 @@ class SportsonlineExtractor(BaseExtractor):
         page_headers["Sec-Fetch-Dest"] = "iframe"
         page_headers.pop("Sec-Fetch-User", None)
         return page_headers
-
-    def _looks_like_block_page(self, html: str) -> bool:
-        lowered = html.lower()
-        return any(
-            marker in lowered
-            for marker in (
-                "sorry, you have been blocked",
-                "attention required!",
-                "cloudflare",
-                "access denied",
-            )
-        )
 
     async def _get_session(self, url: str = None, force_direct: bool = False):
         force_direct = force_direct or self._force_direct
@@ -460,8 +439,6 @@ class SportsonlineExtractor(BaseExtractor):
                 timeout=15,
                 deadline=deadline,
             )
-            parsed_main = urlparse(main_url)
-            main_origin = f"{parsed_main.scheme}://{parsed_main.netloc}"
 
             # Extract first iframe (src can appear in any attribute order)
             iframe_match = re.search(r'<iframe[^>]+(?<!data-)src=["\']([^"\']+)["\']', main_html, re.IGNORECASE)
@@ -547,14 +524,7 @@ class SportsonlineExtractor(BaseExtractor):
                         m3u8_url,
                     )
 
-                    return {
-                        "destination_url": m3u8_url,
-                        "request_headers": playback_headers,
-                        "mediaflow_endpoint": self.mediaflow_endpoint,
-                        "selected_proxy": self.last_used_proxy,
-                        "force_direct": self._force_direct,
-                        "bypass_warp": self.bypass_warp_active,
-                    }
+                    return self._result(m3u8_url, playback_headers)
                 else:
                     raise ExtractorError(
                         "No packed blocks, inline M3U8, or _econfig stream URL found"
@@ -609,14 +579,7 @@ class SportsonlineExtractor(BaseExtractor):
             logger.info(f"Successfully extracted m3u8 URL: {m3u8_url}")
 
             # Return stream configuration
-            return {
-                "destination_url": m3u8_url,
-                "request_headers": playback_headers,
-                "mediaflow_endpoint": self.mediaflow_endpoint,
-                "selected_proxy": self.last_used_proxy,
-                "force_direct": self._force_direct,
-                "bypass_warp": self.bypass_warp_active,
-            }
+            return self._result(m3u8_url, playback_headers)
 
         except ExtractorError:
             raise

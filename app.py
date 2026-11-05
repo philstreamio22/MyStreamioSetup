@@ -2,7 +2,6 @@ import logging
 import sys
 import os
 import asyncio
-import aiohttp
 from aiohttp import web
 
 # Configura logging PRIMA di qualsiasi import che possa emettere log
@@ -12,7 +11,7 @@ logging.basicConfig(
 )
 
 # Aggiungi path corrente per import moduli
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__))))
 
 from services.proxy import HLSProxy
 from config import PORT, RECORDINGS_DIR, APP_VERSION
@@ -25,11 +24,6 @@ from routes.wg_tunnels import setup_wg_tunnel_routes
 from routes.tor_proxy import setup_tor_proxy_routes
 
 logger = logging.getLogger(__name__)
-
-def _read_file(path):
-    """Helper for async file reading via run_in_executor."""
-    with open(path, 'r', encoding='utf-8') as f:
-        return f.read()
 
 # --- Logica di Avvio ---
 def create_app():
@@ -60,7 +54,8 @@ def create_app():
     app.router.add_get('/favicon.ico', proxy.handle_favicon) # ✅ Route Favicon
     
     # ✅ Route Static Files (con path assoluto e creazione automatica)
-    static_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
+    resource_dir = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    static_path = os.path.join(resource_dir, 'static')
     if not os.path.exists(static_path):
         os.makedirs(static_path)
     app.router.add_static('/static', static_path)
@@ -70,8 +65,6 @@ def create_app():
     app.router.add_get('/url-generator', proxy.handle_url_generator)
     app.router.add_get('/info', proxy.handle_info_page)
     app.router.add_get('/api/info', proxy.handle_api_info)
-    app.router.add_get('/api/memory/profile', proxy.handle_memory_profile)
-    app.router.add_post('/api/memory/profile/reset', proxy.handle_memory_profile_reset)
     app.router.add_get('/key', proxy.handle_key_request)
     app.router.add_get('/proxy/manifest.m3u8', proxy.handle_proxy_request)
     app.router.add_get('/proxy/hls/manifest.m3u8', proxy.handle_proxy_request)
@@ -124,8 +117,6 @@ def create_app():
     # ✅ Health check endpoint
     app.router.add_get('/health', lambda r: web.json_response({"status": "ok", "version": APP_VERSION}))
     app.router.add_get('/api/dual/memory', dual_service.handle_memory)
-    # Backward-compatible alias for existing monitoring clients.
-    app.router.add_get('/api/sidecar/memory', dual_service.handle_memory)
 
     app.router.add_post('/dual/sync/links', proxy.handle_dual_sync_links)
     app.router.add_get('/dual/manifest.m3u8', proxy.handle_dual_server_m3u8)
@@ -146,6 +137,8 @@ def create_app():
     app.router.add_get('/api/admin/speedtest', proxy.handle_admin_api_speedtest_status)
     app.router.add_post('/api/admin/extractors/test', proxy.handle_admin_api_test_extractors)
     app.router.add_get('/api/admin/extractors/test', proxy.handle_admin_api_test_extractors_status)
+    app.router.add_get('/api/admin/update/check', proxy.handle_admin_api_update_check)
+    app.router.add_post('/api/admin/update/apply', proxy.handle_admin_api_update_apply)
     # Setup recording/DVR routes
     setup_recording_routes(app, recording_manager)
     # NordVPN / custom WireGuard SOCKS5 tunnels + their admin panels
@@ -177,6 +170,7 @@ def create_app():
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         await tor_proxy.stop()
+        await proxy._run_warp_control("stop")
         await recording_manager.shutdown()
         await shutdown_flare_solver()
     app.on_shutdown.append(on_shutdown)
@@ -192,6 +186,25 @@ def main():
     if sys.platform == 'win32':
         # Silenzia il logger di asyncio per evitare spam di ConnectionResetError
         logging.getLogger('asyncio').setLevel(logging.CRITICAL)
+        try:
+            from services.updater import cleanup_old_update_files
+            cleanup_old_update_files()
+        except Exception:
+            pass
+
+    if "--update" in sys.argv:
+        print("Controllo aggiornamenti EasyProxy...")
+        from services.updater import check_update_info, apply_self_update
+        info = asyncio.run(check_update_info())
+        if info.get("update_available"):
+            print(f"Nuova versione disponibile: v{info['latest_version']} (attuale: v{info['current_version']})")
+            print("Download dell'aggiornamento e riavvio...")
+            success, msg = asyncio.run(apply_self_update())
+            print(msg)
+            sys.exit(0 if success else 1)
+        else:
+            print(f"EasyProxy e' gia' aggiornato all'ultima versione (v{info['current_version']}).")
+            sys.exit(0)
 
     logger.info("🚀 Starting HLS Proxy Server...")
     logger.info("📡 Server available at: http://localhost:%s", PORT)
@@ -204,6 +217,11 @@ def main():
     logger.debug("   • /proxy/manifest.m3u8?url=<URL> - Main stream proxy")
     logger.debug("   • /playlist?url=<definitions> - Playlist generator")
     logger.debug("%s", "=" * 50)
+
+    if getattr(sys, 'frozen', False):
+        import webbrowser
+        import threading
+        threading.Timer(1.5, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
     
     web.run_app(
         app, # Usa l'istanza aiohttp originale per il runner integrato
